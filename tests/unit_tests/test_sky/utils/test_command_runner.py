@@ -1915,6 +1915,81 @@ class TestRsyncIgnoreRegression:
         assert (target / 'keep.json').read_text() == 'payload'
         assert not (target / 'private.json').exists()
 
+    @pytest.mark.parametrize('rules,files,expected', [
+        pytest.param(
+            '*.key\n', {'.certs/prod.key'}, set(), id='hidden-exclusion'),
+        pytest.param('.cfg/*\n!keep.json\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     {'.cfg/keep.json'},
+                     id='hidden-reinclusion'),
+        pytest.param('*.json\n.cfg/*\n!/keep.json\n',
+                     {'keep.json', '.cfg/keep.json', '.cfg/private.json'},
+                     {'keep.json'},
+                     id='root-anchored-reinclusion'),
+        pytest.param('.cfg/**\n!.cfg/*.json\n',
+                     {'.cfg/keep.json', '.cfg/sub/keep.json'},
+                     {'.cfg/keep.json'},
+                     id='single-star-does-not-open-parent'),
+        pytest.param(
+            '.cfg/**\n!.cfg/**/\n!.cfg/keep.json\n!.cfg/**/keep.json\n', {
+                '.cfg/keep.json', '.cfg/private.json', '.cfg/sub/keep.json',
+                '.cfg/sub/private.json'
+            }, {'.cfg/keep.json', '.cfg/sub/keep.json'},
+            id='recursive-reinclusion'),
+        pytest.param('.cfg/*\n!.cfg/keep.json/\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     set(),
+                     id='directory-pattern-does-not-include-file'),
+        pytest.param('.cfg/*\n!.cfg/keep/\n',
+                     {'.cfg/keep/config.json', '.cfg/private.json'},
+                     {'.cfg/keep/config.json'},
+                     id='directory-reinclusion'),
+        pytest.param('.cfg/*\n!k[e]ep.?son\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     {'.cfg/keep.json'},
+                     id='character-class-and-question-mark'),
+        pytest.param('.cfg/*\n!keep.json\n.cfg/keep.json\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     set(),
+                     id='later-exclusion-wins'),
+    ])
+    @pytest.mark.parametrize('via_zip', [
+        pytest.param(False, id='direct-rsync'),
+        pytest.param(True, id='zip-then-rsync'),
+    ])
+    def test_hidden_paths_through_upload_pipeline(self, tmp_path, rules, files,
+                                                  expected, via_zip):
+        """ZIP staging must preserve the final transfer set for hidden paths."""
+        source = tmp_path / 'source'
+        self._write(source, '.skyignore', rules)
+        self._write(source, 'control.txt', 'unmatched control')
+        for filename in files:
+            self._write(source, filename, filename)
+
+        staged = source
+        if via_zip:
+            archive = tmp_path / 'upload.zip'
+            storage_utils.zip_files_and_folders([str(source)],
+                                                archive,
+                                                relative_to_items=True)
+            with zipfile.ZipFile(archive) as zipf:
+                zipf.extractall(tmp_path / 'server')
+            staged = tmp_path / 'server' / source.name
+            assert (staged / '.skyignore').read_text() == rules
+
+        # Always run the final rsync, even if ZIP staging dropped a file.
+        # This distinguishes exclusions rsync can enforce from lost includes.
+        target = self._sync(staged, tmp_path / 'target')
+        actual = {
+            path.relative_to(target).as_posix()
+            for path in target.rglob('*')
+            if path.is_file() and path.name != '.skyignore'
+        }
+        assert actual == expected | {'control.txt'}
+        for filename in expected:
+            assert (target / filename).read_text() == filename
+        assert (target / 'control.txt').read_text() == 'unmatched control'
+
     def test_gitignore_without_repository(self, tmp_path):
         source = tmp_path / 'source'
         self._write(source, '.gitignore', 'data/\n')

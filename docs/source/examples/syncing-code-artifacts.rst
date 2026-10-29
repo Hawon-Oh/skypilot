@@ -198,6 +198,9 @@ This uploads ``keep.json`` while excluding other JSON files. A file cannot be
 re-included while its parent directory is excluded; use ``data/*`` instead of
 ``data/`` when re-including ``!data/keep.json``.
 
+When building exclusion lists for ZIP and bucket uploads, negations match
+previously excluded paths, including paths inside hidden directories.
+
 For rsync uploads, these root rules take precedence over matching rules in
 nested ``.skyignore`` files. Nested files retain their existing rsync exclude
 behavior; ``!`` support described here applies to the root file.
