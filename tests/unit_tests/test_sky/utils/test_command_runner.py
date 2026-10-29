@@ -1585,19 +1585,13 @@ class TestInlineCommandLimit:
 @pytest.mark.skipif(shutil.which('rsync') is None, reason='rsync is required')
 @pytest.mark.parametrize('source_name', ['source with spaces', '작업폴더', '작업 폴더'])
 @pytest.mark.parametrize('with_excludes', [False, True])
-def test_rsync_skyignore_with_source_path_characters(tmp_path, monkeypatch,
-                                                     source_name,
+def test_rsync_skyignore_with_source_path_characters(tmp_path, source_name,
                                                      with_excludes) -> None:
     """Real rsync must preserve spaces and Unicode in paths and file contents."""
     source = tmp_path / source_name
     source.mkdir()
     target = tmp_path / '전송 대상'
     target.mkdir()
-    # Exercise quoting of any generated filter file as well as the source.
-    filter_dir = tmp_path / '임시 필터'
-    filter_dir.mkdir()
-    monkeypatch.setattr(tempfile, 'tempdir', str(filter_dir))
-
     skyignore = '*.json\n!keep.json\n' if with_excludes else ''
     (source / '.skyignore').write_text(skyignore, encoding='utf-8')
     (source / 'keep.json').write_text('재포함할 내용', encoding='utf-8')
@@ -1622,7 +1616,6 @@ def test_rsync_skyignore_with_source_path_characters(tmp_path, monkeypatch,
         assert (target /
                 relative_path).read_bytes() == (source /
                                                 relative_path).read_bytes()
-    assert not list(filter_dir.iterdir())
 
 
 @pytest.mark.skipif(shutil.which('rsync') is None, reason='rsync is required')
@@ -1915,6 +1908,103 @@ class TestRsyncIgnoreRegression:
         assert (target / 'keep.json').read_text() == 'payload'
         assert not (target / 'private.json').exists()
 
+    @pytest.mark.parametrize('rules,files,expected', [
+        pytest.param(
+            '*.key\n', {'.certs/prod.key'}, set(), id='hidden-exclusion'),
+        pytest.param('.cfg/*\n!keep.json\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     {'.cfg/keep.json'},
+                     id='hidden-reinclusion'),
+        pytest.param('*.json\n.cfg/*\n!/keep.json\n',
+                     {'keep.json', '.cfg/keep.json', '.cfg/private.json'},
+                     {'keep.json'},
+                     id='root-anchored-reinclusion'),
+        pytest.param('.cfg/**\n!.cfg/*.json\n',
+                     {'.cfg/keep.json', '.cfg/sub/keep.json'},
+                     {'.cfg/keep.json'},
+                     id='single-star-does-not-open-parent'),
+        pytest.param(
+            '.cfg/**\n!.cfg/**/\n!.cfg/keep.json\n!.cfg/**/keep.json\n', {
+                '.cfg/keep.json', '.cfg/private.json', '.cfg/sub/keep.json',
+                '.cfg/sub/private.json'
+            }, {'.cfg/keep.json', '.cfg/sub/keep.json'},
+            id='recursive-reinclusion'),
+        pytest.param('.cfg/*\n!.cfg/keep.json/\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     set(),
+                     id='directory-pattern-does-not-include-file'),
+        pytest.param('.cfg/*\n!.cfg/keep/\n',
+                     {'.cfg/keep/config.json', '.cfg/private.json'},
+                     {'.cfg/keep/config.json'},
+                     id='directory-reinclusion'),
+        pytest.param('.cfg/*\n!k[e]ep.?son\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     {'.cfg/keep.json'},
+                     id='character-class-and-question-mark'),
+        pytest.param('.cfg/*\n!keep.json\n.cfg/keep.json\n',
+                     {'.cfg/keep.json', '.cfg/private.json'},
+                     set(),
+                     id='later-exclusion-wins'),
+    ])
+    @pytest.mark.parametrize('via_zip', [
+        pytest.param(False, id='direct-rsync'),
+        pytest.param(True, id='zip-then-rsync'),
+    ])
+    def test_hidden_paths_through_upload_pipeline(self, tmp_path, rules, files,
+                                                  expected, via_zip):
+        """ZIP staging must preserve the final transfer set for hidden paths."""
+        source = tmp_path / 'source'
+        self._write(source, '.skyignore', rules)
+        self._write(source, 'control.txt', 'unmatched control')
+        for filename in files:
+            self._write(source, filename, filename)
+
+        staged = source
+        if via_zip:
+            archive = tmp_path / 'upload.zip'
+            storage_utils.zip_files_and_folders([str(source)],
+                                                archive,
+                                                relative_to_items=True)
+            with zipfile.ZipFile(archive) as zipf:
+                zipf.extractall(tmp_path / 'server')
+            staged = tmp_path / 'server' / source.name
+            assert (staged / '.skyignore').read_text() == rules
+
+        # Always run the final rsync, even if ZIP staging dropped a file.
+        # This distinguishes exclusions rsync can enforce from lost includes.
+        target = self._sync(staged, tmp_path / 'target')
+        actual = {
+            path.relative_to(target).as_posix()
+            for path in target.rglob('*')
+            if path.is_file() and path.name != '.skyignore'
+        }
+        assert actual == expected | {'control.txt'}
+        for filename in expected:
+            assert (target / filename).read_text() == filename
+        assert (target / 'control.txt').read_text() == 'unmatched control'
+
+    @pytest.mark.parametrize('filename', [
+        pytest.param(b'keep-\xff.txt', id='non-utf8-pattern'),
+        pytest.param(b"keep '$(touch marker)'.txt", id='shell-metacharacters'),
+    ])
+    def test_inline_filter_preserves_pattern_bytes(self, tmp_path, monkeypatch,
+                                                   filename):
+        monkeypatch.chdir(tmp_path)
+        source = tmp_path / 'source'
+        source.mkdir()
+        (source / '.skyignore').write_bytes(b'*.txt\n!' + filename + b'\n')
+        (source / os.fsdecode(filename)).write_bytes(b'reincluded contents')
+        self._write(source, 'private.txt')
+
+        target = self._sync(source,
+                            tmp_path / 'target',
+                            log_path=str(tmp_path / 'rsync.log'))
+
+        assert (target /
+                os.fsdecode(filename)).read_bytes() == b'reincluded contents'
+        assert not (target / 'private.txt').exists()
+        assert not (tmp_path / 'marker').exists()
+
     def test_gitignore_without_repository(self, tmp_path):
         source = tmp_path / 'source'
         self._write(source, '.gitignore', 'data/\n')
@@ -1984,143 +2074,49 @@ class TestRsyncIgnoreRegression:
         assert not (target / 'private.key').exists()
         assert (target / 'keep.txt').read_text() == 'payload'
 
-    def test_invalid_retry_count_does_not_leak_filter(self, tmp_path,
-                                                      monkeypatch):
-        source = tmp_path / 'source'
-        self._write(source, '.skyignore', '*.json\n!keep.json\n')
-        self._write(source, 'private.json')
-        filter_dir = tmp_path / 'filters'
-        filter_dir.mkdir()
-        monkeypatch.setattr(tempfile, 'tempdir', str(filter_dir))
-
-        with pytest.raises((AssertionError, ValueError)):
-            self._sync(source, tmp_path / 'target', max_retry=0)
-
-        assert not list(filter_dir.iterdir())
-
-    def test_missing_filter_does_not_mask_transfer_error(
-            self, tmp_path, monkeypatch):
-        source = tmp_path / 'source'
-        self._write(source, '.skyignore', '*.json\n!keep.json\n')
-        self._write(source, 'private.json')
-        filter_dir = tmp_path / 'filters'
-        filter_dir.mkdir()
-        monkeypatch.setattr(tempfile, 'tempdir', str(filter_dir))
-
-        def fail_transfer(*args, **kwargs):
-            del args, kwargs
-            for path in filter_dir.rglob('*'):
-                if path.is_file():
-                    path.unlink()
-            raise RuntimeError('original transfer error')
-
-        with mock.patch.object(command_runner.log_lib,
-                               'run_with_log',
-                               side_effect=fail_transfer):
-            with pytest.raises(RuntimeError, match='original transfer error'):
-                self._sync(source, tmp_path / 'target')
-
-
-def _extract_skyignore_filter_path(command: str):
-    """Return the path passed to rsync's merge filter, or None.
-
-    The path is shell-quoted in the command, so tokenize with shlex to undo
-    any quoting before splitting off the value.
-    """
-    for token in shlex.split(command):
-        if token.startswith('--filter=merge '):
-            return token[len('--filter=merge '):]
-    return None
-
 
 class TestRsyncSkyignoreFilter:
-    """Check translated filter contents and lifetime around rsync attempts."""
+    """Check inline filter order and preservation of the existing filters."""
 
-    def _write_skyignore(self, src_dir, content: str) -> None:
-        skyignore = os.path.join(src_dir,
-                                 command_runner.constants.SKY_IGNORE_FILE)
-        with open(skyignore, 'w', encoding='utf-8') as f:
-            f.write(content)
-
-    def _run_up(self, src_dir):
-        """Run an up-sync with run_with_log mocked.
-
-        Returns a dict capturing the rsync `command` and, while the temp file
-        still exists (i.e. inside the run_with_log call, before the finally
-        cleanup), the `filter_path` and its `filter_lines`.
-        """
-        captured = {'filter_path': None, 'filter_lines': None}
-
-        def fake_run_with_log(command, *args, **kwargs):
-            captured['command'] = command
-            path = _extract_skyignore_filter_path(command)
-            captured['filter_path'] = path
-            if path is not None:
-                with open(path, encoding='utf-8') as f:
-                    captured['filter_lines'] = f.read().splitlines()
-            return 0, '', ''
-
+    def test_inline_rules_survive_retry(self, tmp_path):
+        (tmp_path / '.skyignore').write_text('*.json\n!keep.json\n',
+                                             encoding='utf-8')
         with mock.patch.object(command_runner.log_lib,
                                'run_with_log',
-                               side_effect=fake_run_with_log):
-            runner = command_runner.LocalProcessCommandRunner()
-            runner.rsync(str(src_dir), '/tmp/dst', up=True, stream_logs=False)
-        return captured
+                               side_effect=[(1, '', 'retry'),
+                                            (0, '', '')]) as run, \
+                mock.patch.object(command_runner.time, 'sleep'):
+            command_runner.LocalProcessCommandRunner().rsync(str(tmp_path),
+                                                             '/tmp/dst',
+                                                             up=True,
+                                                             stream_logs=False)
 
-    def test_negation_precedes_exclude_rule(self, tmp_path) -> None:
-        """Include rules precede the patterns they override in the merge file."""
-        (tmp_path / 'a.json').write_text('x')
-        (tmp_path / 'keep.json').write_text('x')
-        self._write_skyignore(tmp_path, '*.json\n!keep.json\n')
+        assert run.call_count == 2
+        assert run.call_args_list[0].args[0] == run.call_args_list[1].args[0]
+        assert '--filter=+ keep.json' in shlex.split(run.call_args.args[0])
 
-        captured = self._run_up(tmp_path)
-
-        assert captured['filter_path'] is not None
-        assert captured['filter_lines'] == ['+ keep.json', '- *.json']
-
-    def test_no_filter_file_when_nothing_excluded(self, tmp_path) -> None:
-        """With nothing to exclude, no merge filter is passed and no temp
-        file is left behind."""
-        (tmp_path / 'a.json').write_text('x')
-        # An empty .skyignore excludes nothing; using .skyignore avoids the
-        # gitignore path needing a real git repo.
-        self._write_skyignore(tmp_path, '')
-
-        captured = self._run_up(tmp_path)
-
-        assert captured['filter_path'] is None
-        assert '--filter=merge ' not in captured['command']
-
-    def test_filter_file_cleaned_up_on_success(self, tmp_path) -> None:
-        """The temporary filter file is removed after rsync finishes."""
-        (tmp_path / 'a.json').write_text('x')
-        self._write_skyignore(tmp_path, '*.json\n!keep.json\n')
-
-        captured = self._run_up(tmp_path)
-
-        assert captured['filter_path'] is not None
-        assert not os.path.exists(captured['filter_path'])
-
-    def test_filter_file_cleaned_up_on_unexpected_error(self, tmp_path) -> None:
-        """An unexpected rsync error also cleans up the temporary filter."""
-        (tmp_path / 'a.json').write_text('x')
-        self._write_skyignore(tmp_path, '*.json\n!keep.json\n')
-
-        seen = {'path': None}
-
-        def fake_run_with_log(command, *args, **kwargs):
-            seen['path'] = _extract_skyignore_filter_path(command)
-            raise RuntimeError('boom')
-
+    @pytest.mark.parametrize('rules,expected', [
+        ('*.json\n!keep.json\n', ['+ keep.json', '- *.json']),
+        ('*.json\n!keep.json\nkeep.json\n',
+         ['- keep.json', '+ keep.json', '- *.json']),
+        ('', []),
+        ('*.json\n', []),
+    ])
+    def test_inline_rules_precede_dir_merge(self, tmp_path, rules, expected):
+        (tmp_path / '.skyignore').write_text(rules, encoding='utf-8')
         with mock.patch.object(command_runner.log_lib,
                                'run_with_log',
-                               side_effect=fake_run_with_log):
-            runner = command_runner.LocalProcessCommandRunner()
-            with pytest.raises(RuntimeError):
-                runner.rsync(str(tmp_path),
-                             '/tmp/dst',
-                             up=True,
-                             stream_logs=False)
+                               return_value=(0, '', '')) as run:
+            command_runner.LocalProcessCommandRunner().rsync(str(tmp_path),
+                                                             '/tmp/dst',
+                                                             up=True,
+                                                             stream_logs=False)
 
-        assert seen['path'] is not None
-        assert not os.path.exists(seen['path'])
+        command = run.call_args.args[0]
+        filters = [
+            token[len('--filter='):]
+            for token in shlex.split(command)
+            if token.startswith('--filter=')
+        ]
+        assert filters == expected + ['dir-merge,- .skyignore']
+        assert '--filter=merge ' not in command

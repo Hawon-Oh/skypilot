@@ -221,6 +221,32 @@ def test_get_excluded_files_from_skyignore_negation_no_match(
     assert set(excluded_files) == expected_excluded
 
 
+@pytest.mark.parametrize('negation,remaining', [
+    ('!keep.json', {'.cfg/private.json', '.cfg/sub'}),
+    ('!/keep.json',
+     {'.cfg/keep.json', '.cfg/private.json', '.cfg/sub', '.cfg/sub/keep.json'}),
+    ('!.cfg/*.json', {'keep.json', '.cfg/sub', '.cfg/sub/keep.json'}),
+    ('!.cfg/**/keep.json', {'keep.json', '.cfg/private.json', '.cfg/sub'}),
+    ('!.cfg/keep.json/', {
+        'keep.json', '.cfg/keep.json', '.cfg/private.json', '.cfg/sub',
+        '.cfg/sub/keep.json'
+    }),
+])
+def test_skyignore_negation_matches_excluded_hidden_paths(
+        tmp_path, negation, remaining):
+    """Check the exclusion list shared by ZIP and bucket upload paths."""
+    for filename in ('keep.json', '.cfg/keep.json', '.cfg/private.json',
+                     '.cfg/sub/keep.json'):
+        path = tmp_path / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('payload', encoding='utf-8')
+    _write_skyignore(tmp_path, '*.json\n.cfg/**\n' + negation + '\n')
+
+    excluded = storage_utils.get_excluded_files_from_skyignore(str(tmp_path))
+
+    assert set(excluded) == remaining
+
+
 def test_get_excluded_files_from_gitignore(gitignore_dir):
     # Test function
     excluded_files = storage_utils.get_excluded_files_from_gitignore(

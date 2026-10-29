@@ -1,5 +1,4 @@
 """Runner for commands to be executed on the cluster."""
-import contextlib
 import enum
 import fcntl
 import hashlib
@@ -16,8 +15,8 @@ import tempfile
 import termios
 import threading
 import time
-from typing import (Any, Callable, Dict, Iterable, Iterator, List, Optional,
-                    Tuple, Type, Union)
+from typing import (Any, Callable, Dict, Iterable, List, Optional, Tuple, Type,
+                    Union)
 import urllib.parse
 import uuid
 
@@ -98,13 +97,11 @@ _DEFAULT_CONNECT_TIMEOUT = 30
 TIMEOUT_RETURNCODE = 124
 
 
-@contextlib.contextmanager
-def _skyignore_rsync_filter(
-        skyignore_path: Optional[pathlib.Path]) -> Iterator[Optional[str]]:
+def _skyignore_rsync_filters(
+        skyignore_path: Optional[pathlib.Path]) -> List[str]:
     """Translate root skyignore negations while leaving matching to rsync."""
     if skyignore_path is None or not skyignore_path.is_file():
-        yield None
-        return
+        return []
     # Preserve filename bytes, including spaces and Unicode line separators.
     # Only LF and CRLF delimit rules; rsync does not require UTF-8 input.
     lines = skyignore_path.read_bytes().split(b'\n')
@@ -114,8 +111,7 @@ def _skyignore_rsync_filter(
             pattern.startswith(b'!') and len(pattern) > 1
             for pattern in patterns):
         # Preserve the original dir-merge behavior when no negations are used.
-        yield None
-        return
+        return []
     rules = []
     # Rsync uses the first matching rule; skyignore negations use the last.
     for pattern in reversed(patterns):
@@ -125,10 +121,7 @@ def _skyignore_rsync_filter(
                 rules.append(b'+ ' + pattern)
         else:
             rules.append(b'- ' + pattern)
-    with tempfile.TemporaryDirectory(prefix='skyignore-') as filter_dir:
-        filter_path = pathlib.Path(filter_dir) / 'filter'
-        filter_path.write_bytes(b'\n'.join(rules) + b'\n')
-        yield f'--filter={shlex.quote("merge " + str(filter_path))}'
+    return [f'--filter={shlex.quote(os.fsdecode(rule))}' for rule in rules]
 
 
 def _timed_out_result(
@@ -711,62 +704,60 @@ class CommandRunner:
         backoff = common_utils.Backoff(initial_backoff=5, max_backoff_factor=5)
         assert max_retry > 0, f'max_retry {max_retry} must be positive.'
         timed_out = False
-        with _skyignore_rsync_filter(
-                skyignore_path if up else None) as merge_filter:
-            if merge_filter is not None:
-                rsync_command.insert(filter_index, merge_filter)
-            command = ' '.join(rsync_command)
-            logger.debug(f'Running rsync command: {command}')
-            while max_retry >= 0:
-                attempt_timeout: Optional[int] = None
-                if deadline is not None:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
-                        # The deadline is exhausted before this attempt could
-                        # run. Set the outputs to reflect the timeout so the
-                        # post-loop error handling has defined (and accurate)
-                        # values.
-                        timed_out = True
-                        returncode = 255
-                        stdout = ''
-                        stderr = f'rsync timed out after {timeout} seconds.'
-                        break
-                    # run_with_log expects an int; clamp to >=1 so we never pass
-                    # 0, which would disable the timeout.
-                    attempt_timeout = max(1, int(remaining))
-                try:
-                    returncode, stdout, stderr = log_lib.run_with_log(
-                        command,
-                        log_path=log_path,
-                        stream_logs=stream_logs,
-                        shell=True,
-                        require_outputs=True,
-                        timeout=attempt_timeout)
-                except subprocess.TimeoutExpired:
-                    # run_with_log already terminated the rsync process tree.
-                    # The attempt consumed the remaining budget, so the overall
-                    # deadline is exhausted; stop instead of retrying.
+        rsync_command[filter_index:filter_index] = _skyignore_rsync_filters(
+            skyignore_path if up else None)
+        command = ' '.join(rsync_command)
+        logger.debug(f'Running rsync command: {command}')
+        while max_retry >= 0:
+            attempt_timeout: Optional[int] = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    # The deadline is exhausted before this attempt could
+                    # run. Set the outputs to reflect the timeout so the
+                    # post-loop error handling has defined (and accurate)
+                    # values.
                     timed_out = True
                     returncode = 255
                     stdout = ''
                     stderr = f'rsync timed out after {timeout} seconds.'
                     break
-                if returncode == 0:
+                # run_with_log expects an int; clamp to >=1 so we never pass
+                # 0, which would disable the timeout.
+                attempt_timeout = max(1, int(remaining))
+            try:
+                returncode, stdout, stderr = log_lib.run_with_log(
+                    command,
+                    log_path=log_path,
+                    stream_logs=stream_logs,
+                    shell=True,
+                    require_outputs=True,
+                    timeout=attempt_timeout)
+            except subprocess.TimeoutExpired:
+                # run_with_log already terminated the rsync process tree.
+                # The attempt consumed the remaining budget, so the overall
+                # deadline is exhausted; stop instead of retrying.
+                timed_out = True
+                returncode = 255
+                stdout = ''
+                stderr = f'rsync timed out after {timeout} seconds.'
+                break
+            if returncode == 0:
+                break
+            max_retry -= 1
+            sleep_time = backoff.current_backoff()
+            if deadline is not None:
+                # Do not let the backoff wait push us past the deadline.
+                new_remaining = deadline - time.monotonic()
+                if new_remaining <= 0 or sleep_time >= new_remaining:
+                    # The deadline will be exhausted by the time
+                    # this backoff wait completed; early exit.
+                    timed_out = True
+                    returncode = 255
+                    stdout = ''
+                    stderr = f'rsync timed out after {timeout} seconds.'
                     break
-                max_retry -= 1
-                sleep_time = backoff.current_backoff()
-                if deadline is not None:
-                    # Do not let the backoff wait push us past the deadline.
-                    new_remaining = deadline - time.monotonic()
-                    if new_remaining <= 0 or sleep_time >= new_remaining:
-                        # The deadline will be exhausted by the time
-                        # this backoff wait completed; early exit.
-                        timed_out = True
-                        returncode = 255
-                        stdout = ''
-                        stderr = f'rsync timed out after {timeout} seconds.'
-                        break
-                time.sleep(sleep_time)
+            time.sleep(sleep_time)
 
         direction = 'up' if up else 'down'
         timeout_hint = (f'rsync timed out after {timeout} seconds. '
